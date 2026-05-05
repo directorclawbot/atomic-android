@@ -3,10 +3,15 @@ import json
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 WORKSPACE = Path('/home/user/.openclaw/workspace')
 TRACKING_INDEX = WORKSPACE / 'tracking' / '_index.json'
 CRON_SNAPSHOT = WORKSPACE / 'mission-control' / 'cron-snapshot.json'
+
+import sys
+sys.path.insert(0, str(WORKSPACE / 'scripts'))
+import cron_file
 DASHBOARD = WORKSPACE / 'mission-control' / 'dashboard.md'
 RUNWAY = WORKSPACE / 'mission-control' / 'daily-runway.md'
 OPERATOR_CONSOLE = WORKSPACE / 'mission-control' / 'today-operator-console.md'
@@ -76,12 +81,14 @@ def refresh_cron_snapshot():
             check=True,
         )
         data = json.loads(result.stdout)
-        _atomic_json_write(CRON_SNAPSHOT, data)
+        if not cron_file.safe_write_json(CRON_SNAPSHOT, data):
+            cron_file.log_error('refresh_cron_snapshot', str(CRON_SNAPSHOT), 'safe_write_json returned False')
         return data
     except subprocess.TimeoutExpired:
         # Fall back to cached snapshot on timeout
         return load_json(CRON_SNAPSHOT, {'jobs': []})
-    except Exception:
+    except Exception as exc:
+        cron_file.log_error('refresh_cron_snapshot', str(CRON_SNAPSHOT), str(exc))
         return load_json(CRON_SNAPSHOT, {'jobs': []})
 
 

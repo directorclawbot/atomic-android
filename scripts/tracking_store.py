@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
+import logging
 import os
-import shutil
 import sys
-import tempfile
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +17,15 @@ WORKSPACE = Path('/home/user/.openclaw/workspace')
 TRACKING_DIR = WORKSPACE / 'tracking'
 COLLECTIONS_DIR = TRACKING_DIR / 'collections'
 INDEX_PATH = TRACKING_DIR / '_index.json'
-ERROR_LOG_PATH = TRACKING_DIR / 'state' / 'cron-write-errors.json'
+
+# Cron-safe file utilities (fcntl locking + read-back verification + error log)
+sys.path.insert(0, str(WORKSPACE / 'scripts'))
+import cron_file  # noqa: E402
+
+_log = logging.getLogger('tracking_store')
+_log.setLevel(logging.INFO)
+if not _log.handlers:
+    _log.addHandler(logging.StreamHandler(sys.stderr))
 
 
 DEFAULT_COLLECTION_TEMPLATE = {
@@ -79,68 +89,136 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
+# ---------------------------------------------------------------------------
+# File I/O — all routed through cron_file for locking + verification
+# ---------------------------------------------------------------------------
+
+def load_json(path: Path, default: Any) -> Any:
+    """Load JSON, returning default on error (error is logged by cron_file)."""
+    return cron_file.load_json_safe(path, default)
+
+
+def save_json(path: Path, data: Any) -> bool:
+    """Write JSON with fcntl locking + read-back verification. Returns True on success.
+
+    On failure, logs to cron-write-errors.json and returns False.
+    """
+    ok = cron_file.safe_write_json(path, data)
+    if not ok:
+        cron_file.log_error('save_json', str(path), 'safe_write_json returned False')
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Locked read-modify-write helpers
+# ---------------------------------------------------------------------------
+
+def locked_update(path: Path, update_fn, *, lock_dir: Optional[Path] = None) -> bool:
+    """Read file, apply update_fn, write back — all under fcntl lock.
+
+    update_fn: callable(current_data) -> new_data
+    Returns True on success, False on any failure (logged to cron-write-errors.json).
+    """
+    lock_dir = lock_dir or (WORKSPACE / 'tracking' / '.locks')
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f'{path.name}.lock'
+
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    except OSError as exc:
+        cron_file.log_error('locked_update_open', str(lock_path), str(exc))
+        return False
+
+    acquired = False
+    for _ in range(50):  # up to 5s
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                try:
+                    os.close(lock_fd)
+                except Exception:
+                    pass
+                cron_file.log_error('locked_update_acquire', str(lock_path), str(exc))
+                return False
+        time.sleep(0.1)
+
+    if not acquired:
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+        cron_file.log_error('locked_update_timeout', str(lock_path), 'could not acquire lock within 5s')
+        return False
+
+    try:
+        # Read current state
+        data = cron_file.load_json_safe(path, None)
+        if data is None:
+            cron_file.log_error('locked_update_read', str(path), 'file does not exist')
+            return False
+
+        # Apply modification
+        try:
+            new_data = update_fn(data)
+        except Exception as exc:
+            cron_file.log_error('locked_update_fn', str(path), f'update_fn raised: {exc}')
+            return False
+
+        # Inline atomic write: temp file + rename (lock already held, no re-acquire needed)
+        tmp = path.parent / f'.{path.name}.tmp'
+        try:
+            tmp.write_text(json.dumps(new_data, indent=2, sort_keys=False) + '\n')
+        except Exception as exc:
+            cron_file.log_error('locked_update_write', str(path), f'temp write failed: {exc}')
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+            return False
+
+        try:
+            os.replace(str(tmp), str(path))
+        except OSError as exc:
+            cron_file.log_error('locked_update_write', str(path), f'rename failed: {exc}')
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+            return False
+
+        # Read back to verify
+        try:
+            verified = json.loads(path.read_text())
+            if verified is None:
+                raise ValueError('read back None')
+        except Exception as exc:
+            cron_file.log_error('locked_update_verify', str(path), f'read-back failed: {exc}')
+            return False
+
+        return True
+
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Layout
+# ---------------------------------------------------------------------------
+
 def ensure_layout() -> None:
     TRACKING_DIR.mkdir(parents=True, exist_ok=True)
     COLLECTIONS_DIR.mkdir(parents=True, exist_ok=True)
     if not INDEX_PATH.exists():
-        save_json(INDEX_PATH, {'version': 1, 'collections': {}, 'updated_at': now_iso()})
-
-
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return deepcopy(default)
-    return json.loads(path.read_text())
-
-
-def _log_write_error(operation: str, file_path: str, error: str) -> None:
-    """Append an error to the cron-write-errors.json log."""
-    ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    errors = []
-    if ERROR_LOG_PATH.exists():
-        try:
-            errors = json.loads(ERROR_LOG_PATH.read_text()).get('errors', [])
-        except Exception:
-            errors = []
-    errors.append({
-        'ts': now_iso(),
-        'file': file_path,
-        'operation': operation,
-        'error': str(error)[:500],
-    })
-    # Keep last 100 errors
-    errors = errors[-100:]
-    try:
-        ERROR_LOG_PATH.write_text(json.dumps({'errors': errors}, indent=2}) + '\n')
-    except Exception:
-        pass  # Last-resort: never fail silently in a way that cascades
-
-
-def atomic_write_json(filepath: Path, data: Any) -> None:
-    """Write JSON atomically: write to temp file, verify read-back, then rename."""
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    temp = str(filepath) + '.tmp'
-    try:
-        with open(temp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, sort_keys=False)
-            f.write('\n')
-        # Verify read-back
-        with open(temp, encoding='utf-8') as f:
-            verify = json.load(f)
-        if verify != data:
-            raise RuntimeError(f'Write verification failed for {filepath}: data mismatch after write')
-        os.replace(temp, filepath)
-    except Exception as exc:
-        _log_write_error('write', str(filepath), exc)
-        raise
-
-
-def save_json(path: Path, data: Any) -> None:
-    """Save JSON with atomic write + read-back verification. Errors are logged."""
-    try:
-        atomic_write_json(path, data)
-    except Exception as exc:
-        _log_write_error('write', str(path), f'{type(exc).__name__}: {exc}')
-        raise RuntimeError(f'Failed to save {path}: {exc}') from exc
+        ok = cron_file.write_json_logged(INDEX_PATH, {'version': 1, 'collections': {}, 'updated_at': now_iso()})
+        if not ok:
+            _log.error('Failed to write initial index — tracking may not persist correctly')
 
 
 def slug(text: str) -> str:
@@ -154,15 +232,23 @@ def collection_path(name: str) -> Path:
     return COLLECTIONS_DIR / f'{slug(name)}.json'
 
 
+# ---------------------------------------------------------------------------
+# Index operations
+# ---------------------------------------------------------------------------
+
 def load_index() -> Dict[str, Any]:
     ensure_layout()
     return load_json(INDEX_PATH, {'version': 1, 'collections': {}, 'updated_at': now_iso()})
 
 
-def save_index(index: Dict[str, Any]) -> None:
+def save_index(index: Dict[str, Any]) -> bool:
     index['updated_at'] = now_iso()
-    save_json(INDEX_PATH, index)
+    return save_json(INDEX_PATH, index)
 
+
+# ---------------------------------------------------------------------------
+# Collection operations
+# ---------------------------------------------------------------------------
 
 def load_collection(name: str) -> Dict[str, Any]:
     path = collection_path(name)
@@ -171,18 +257,26 @@ def load_collection(name: str) -> Dict[str, Any]:
     return load_json(path, deepcopy(DEFAULT_COLLECTION_TEMPLATE))
 
 
-def save_collection(name: str, data: Dict[str, Any]) -> None:
+def save_collection(name: str, data: Dict[str, Any]) -> bool:
     data['collection']['updated_at'] = now_iso()
-    save_json(collection_path(name), data)
+    col_path = collection_path(name)
+    if not save_json(col_path, data):
+        cron_file.log_error('save_collection', str(col_path), 'save_json returned False')
+        return False
+
+    # Update index — best effort; non-fatal if this fails
     index = load_index()
     index['collections'][slug(name)] = {
-        'path': str(collection_path(name).relative_to(WORKSPACE)),
+        'path': str(col_path.relative_to(WORKSPACE)),
         'title': data['collection'].get('title') or name,
         'default_category': data['collection'].get('default_category', ''),
         'updated_at': data['collection']['updated_at'],
         'item_count': len(data.get('items', [])),
     }
-    save_index(index)
+    if not save_index(index):
+        cron_file.log_error('save_collection', str(INDEX_PATH), 'index update failed (collection write succeeded)')
+
+    return True
 
 
 def create_collection(name: str, title: str, description: str, default_category: str) -> Dict[str, Any]:
@@ -202,6 +296,10 @@ def create_collection(name: str, title: str, description: str, default_category:
     save_collection(name, data)
     return data
 
+
+# ---------------------------------------------------------------------------
+# Record helpers
+# ---------------------------------------------------------------------------
 
 def infer_source_key(record: Dict[str, Any]) -> str:
     for key in ('source_key', 'external_id', 'source_url', 'title'):
@@ -274,21 +372,40 @@ def normalize_record(collection_name: str, record: Dict[str, Any], previous: Opt
     return base
 
 
+# ---------------------------------------------------------------------------
+# CRUD — all use locked cycle to prevent concurrent clobbering
+# ---------------------------------------------------------------------------
+
 def upsert_record(collection_name: str, record: Dict[str, Any]) -> Dict[str, Any]:
-    data = load_collection(collection_name)
-    items: List[Dict[str, Any]] = data.setdefault('items', [])
-    source_key = infer_source_key(record)
-    record_id = record.get('record_id')
-    for idx, existing in enumerate(items):
-        if existing.get('source_key') == source_key or (record_id and existing.get('record_id') == record_id):
-            updated = normalize_record(collection_name, record, previous=existing)
-            items[idx] = updated
-            save_collection(collection_name, data)
-            return updated
-    created = normalize_record(collection_name, record)
-    items.append(created)
-    save_collection(collection_name, data)
-    return created
+    """Atomic upsert: find existing by source_key/record_id or create new."""
+    col_path = collection_path(collection_name)
+
+    def do_upsert(data: Dict[str, Any]) -> Dict[str, Any]:
+        items: List[Dict[str, Any]] = data.setdefault('items', [])
+        source_key = infer_source_key(record)
+        record_id = record.get('record_id')
+        for idx, existing in enumerate(items):
+            if existing.get('source_key') == source_key or (record_id and existing.get('record_id') == record_id):
+                updated = normalize_record(collection_name, record, previous=existing)
+                items[idx] = updated
+                return data
+        created = normalize_record(collection_name, record)
+        items.append(created)
+        return data
+
+    ok = locked_update(col_path, do_upsert)
+    if not ok:
+        cron_file.log_error('upsert_record', str(col_path), 'locked_update returned False — record may not be saved')
+        raise SystemExit(f'Failed to save record to collection: {collection_name}')
+
+    # Reload and return the full record so callers get the persisted state
+    reloaded = load_collection(collection_name)
+    rid = infer_record_id(collection_name, record)
+    for item in reloaded.get('items', []):
+        if item.get('record_id') == rid:
+            return item
+    # Fallback: return the record_id only if we could not find the saved item
+    return {'record_id': rid, 'status': 'upserted'}
 
 
 def get_record(collection_name: str, record_id: str) -> Dict[str, Any]:
@@ -299,28 +416,42 @@ def get_record(collection_name: str, record_id: str) -> Dict[str, Any]:
     raise SystemExit(f'Record not found: {record_id}')
 
 
+def _atomic_field_update(collection_name: str, record_id: str, patch_fn) -> Dict[str, Any]:
+    """Apply patch_fn(item) -> bool to matching item under lock."""
+    col_path = collection_path(collection_name)
+
+    def do_patch(data: Dict[str, Any]) -> Dict[str, Any]:
+        for idx, item in enumerate(data.get('items', [])):
+            if item.get('record_id') == record_id:
+                if patch_fn(item):
+                    return data
+                else:
+                    raise ValueError('patch_fn returned False')
+        raise KeyError(record_id)
+
+    ok = locked_update(col_path, do_patch)
+    if not ok:
+        cron_file.log_error('_atomic_field_update', str(col_path), 'locked_update returned False')
+        raise SystemExit(f'Failed to update record: {collection_name}/{record_id}')
+    return get_record(collection_name, record_id)
+
+
 def mark_sent(collection_name: str, record_id: str, digest_id: str, note: str = '') -> Dict[str, Any]:
-    data = load_collection(collection_name)
-    for item in data.get('items', []):
-        if item.get('record_id') == record_id:
-            item['status'] = 'sent'
-            item['last_sent_at'] = now_iso()
-            item['sent_count'] = int(item.get('sent_count') or 0) + 1
-            item.setdefault('history', []).append(event('sent', note or 'Included in digest', {'digest_id': digest_id}))
-            save_collection(collection_name, data)
-            return item
-    raise SystemExit(f'Record not found: {record_id}')
+    def patch(item):
+        item['status'] = 'sent'
+        item['last_sent_at'] = now_iso()
+        item['sent_count'] = int(item.get('sent_count') or 0) + 1
+        item.setdefault('history', []).append(event('sent', note or 'Included in digest', {'digest_id': digest_id}))
+        return True
+    return _atomic_field_update(collection_name, record_id, patch)
 
 
 def add_note(collection_name: str, record_id: str, note: str) -> Dict[str, Any]:
-    data = load_collection(collection_name)
-    for item in data.get('items', []):
-        if item.get('record_id') == record_id:
-            item.setdefault('notes', []).append(note)
-            item.setdefault('history', []).append(event('note_added', note))
-            save_collection(collection_name, data)
-            return item
-    raise SystemExit(f'Record not found: {record_id}')
+    def patch(item):
+        item.setdefault('notes', []).append(note)
+        item.setdefault('history', []).append(event('note_added', note))
+        return True
+    return _atomic_field_update(collection_name, record_id, patch)
 
 
 def update_record(
@@ -338,10 +469,7 @@ def update_record(
     follow_up_patch: Optional[Dict[str, Any]] = None,
     notes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    data = load_collection(collection_name)
-    for item in data.get('items', []):
-        if item.get('record_id') != record_id:
-            continue
+    def patch(item):
         changes: List[str] = []
         if status is not None:
             item['status'] = status
@@ -379,9 +507,8 @@ def update_record(
         item['last_seen_at'] = now_iso()
         if changes:
             item.setdefault('history', []).append(event('updated_fields', ', '.join(changes)))
-        save_collection(collection_name, data)
-        return item
-    raise SystemExit(f'Record not found: {record_id}')
+        return True
+    return _atomic_field_update(collection_name, record_id, patch)
 
 
 def list_records(collection_name: str, status: str = '', follow_up_only: bool = False, limit: int = 20) -> List[Dict[str, Any]]:
@@ -433,13 +560,15 @@ def stats() -> Dict[str, Any]:
     for name in sorted(index.get('collections', {})):
         data = load_collection(name)
         items = data.get('items', [])
+        # Handle both standard 'collection' key and flat-schema files (decisions, reprice-watchdog, etc.)
+        col = data.get('collection') or {}
         collections.append({
             'name': name,
-            'title': data['collection'].get('title') or name,
+            'title': col.get('title') or data.get('title') or name,
             'items': len(items),
             'sent': sum(1 for item in items if item.get('sent_count')),
-            'pending_follow_up': sum(1 for item in items if (item.get('follow_up') or {}).get('status') not in ('none', 'done', '')),
-            'updated_at': data['collection'].get('updated_at'),
+            'pending_follow_up': sum(1 for item in items if isinstance(item.get('follow_up'), dict) and (item.get('follow_up') or {}).get('status') not in ('none', 'done', '')),
+            'updated_at': col.get('updated_at') or data.get('updated_at') or '',
         })
     return {'collections': collections, 'updated_at': now_iso()}
 
@@ -473,6 +602,10 @@ def print_json(data: Any) -> None:
     sys.stdout.write('\n')
 
 
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
 def cmd_init(args: argparse.Namespace) -> None:
     data = create_collection(args.name, args.title, args.description, args.default_category)
     print_json(data)
@@ -480,8 +613,9 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def cmd_upsert(args: argparse.Namespace) -> None:
     record = parse_record_json(args.json)
-    updated = upsert_record(args.name, record)
-    print_json(updated)
+    updated_id = upsert_record(args.name, record)
+    # Print the record_id as confirmation
+    print_json({'record_id': updated_id, 'status': 'upserted'})
 
 
 def cmd_mark_sent(args: argparse.Namespace) -> None:

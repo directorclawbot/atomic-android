@@ -14,9 +14,14 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 WORKSPACE = Path('/home/user/.openclaw/workspace')
+sys.path.insert(0, str(WORKSPACE / 'scripts'))
+import cron_file  # noqa: E402
+
+WORKSPACE = Path('/home/user/.openclaw/workspace')  # re-assign after cron_file import
 DEFAULT_DB = WORKSPACE / 'tracking/state/weekend-research/weekend_sources.sqlite3'
 DEFAULT_PLANNER = WORKSPACE / 'tracking/collections/weekend-planner.json'
 
